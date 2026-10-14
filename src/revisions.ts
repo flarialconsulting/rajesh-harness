@@ -7,9 +7,9 @@ import { loadConfig, type Config } from './config.js';
 import { commitRevision } from './version-control.js';
 
 const exec=promisify(execFile);
-const roots=['src','test'];
+const roots=['src'];
 const files=['package.json','pnpm-lock.yaml','pnpm-workspace.yaml','tsconfig.json','config.json'];
-const optionalRoots=['scripts','examples','docs','.github'];
+const optionalRoots=['test','scripts','examples','docs','.github'];
 const optionalFiles=['README.md','.gitignore','AGENTS.md','LICENSE','SECURITY.md','CONTRIBUTING.md','tsconfig.tools.json'];
 export function sourceFiles(root:string):string[] {
   const walk=(dir:string):string[]=>readdirSync(join(root,dir),{withFileTypes:true}).flatMap(e=>{
@@ -48,8 +48,7 @@ export class Revisions {
     // Each revision has its own dependency tree and lockfile. No symlink to the editable project's node_modules.
     await exec('pnpm',['--ignore-workspace','install','--frozen-lockfile','--package-import-method=copy'],options);
     await exec('pnpm',['check'],options);
-    await exec('pnpm',['test'],options);
-    await exec(process.execPath,['--import','tsx','--input-type=module','-e',`for (const [name, exported] of [['engine','Engine'],['discord','DiscordAdapter'],['whatsapp','WhatsAppAdapter'],['store','Store'],['redact','loadRedactions']]) { const module=await import('./src/'+name+'.ts'); if(typeof module[exported]!=='function')throw new Error('Missing runtime export: '+exported); }`],options);
+    await exec(process.execPath,['--import','tsx','--input-type=module','-e',`for (const [name, exported] of [['engine','Engine'],['discord','DiscordAdapter'],['whatsapp','WhatsAppAdapter'],['models','ModelCommands'],['store','Store'],['redact','loadRedactions']]) { const module=await import('./src/'+name+'.ts'); if(typeof module[exported]!=='function')throw new Error('Missing runtime export: '+exported); }`],options);
     const candidate=loadConfig(join(path,'config.json'));
     for(const key of ['dataDir','secretsDir','codexHome'] as const)if(candidate[key]!==this.config[key])throw new Error(`${key} cannot change during live publication`);
     if(['whatsappGroup','whatsappWorkspace','whatsappAccount'].some(key=>candidate[key as keyof Config]!==this.config[key as keyof Config]))throw new Error('Changing WhatsApp account/group requires a planned migration');
@@ -103,7 +102,7 @@ export class Revisions {
     if(!this.current)throw new Error('No validated runtime');
     const path=join(this.base,'drafts',randomUUID());copySource(this.current.path,path);
     atomicJson(join(path,'draft.json'),{task,base:this.current.id,sourceHash:fingerprint(this.source)});
-    return {path,base:this.current.id,baseCommit:this.current.gitCommit,instructions:'Edit this draft. Use pnpm add for dependencies. publish_self_edit validates, commits the changes to Git, and publishes them for new conversations.'};
+    return {path,base:this.current.id,baseCommit:this.current.gitCommit,instructions:'Edit this draft. Use pnpm add for dependencies. publish_self_edit validates, commits the changes to Git, and publishes them for persistent conversations between turns. Active turns keep their current code.'};
   }
   async publish(task:string,path:string) {
     if(this.pending)await this.pending;

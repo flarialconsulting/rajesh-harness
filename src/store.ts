@@ -5,6 +5,7 @@ import { gzipSync } from 'node:zlib';
 import { createHash } from 'node:crypto';
 import type { Workspace } from './config.js';
 import { redactValue } from './redact.js';
+import { ensureLatencyStorage } from './latency.js';
 
 export interface Message {
   id: string; platform: string; workspace: Workspace; channel: string; author: string;
@@ -34,6 +35,7 @@ export class Store {
       CREATE TABLE IF NOT EXISTS origins (id TEXT PRIMARY KEY, thread TEXT, state TEXT);
       CREATE TABLE IF NOT EXISTS inbox (id TEXT PRIMARY KEY, platform TEXT, account TEXT, channel TEXT, message TEXT, payload TEXT, state TEXT);
     `);
+    ensureLatencyStorage(this);
   }
   transaction<T>(fn: () => T): T {
     if(this.transactionDepth)return fn();

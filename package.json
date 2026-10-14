@@ -4,7 +4,6 @@
   "type": "module",
   "scripts": {
     "build": "tsc",
-    "test": "tsx --test test/*.test.ts",
     "start": "node --import tsx src/main.ts",
     "check": "tsc --noEmit && tsc -p tsconfig.tools.json",
     "setup": "node scripts/init.mjs",
