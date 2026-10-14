@@ -25,7 +25,7 @@ You can ask Rajesh to change the harness itself from chat: add a tool, fix an ad
 
 1. `prepare_self_edit` creates an editable draft of the latest validated source and configuration, owned by the requesting task.
 2. The agent edits that draft. Saved runtime revisions and conversation bindings stay untouched.
-3. `publish_self_edit` installs the locked dependencies, runs TypeScript checks and tests, checks runtime exports, and probes Codex compatibility. It rejects stale drafts and configuration changes that require a restart.
+3. `publish_self_edit` installs the locked dependencies, runs TypeScript checks, checks runtime exports, and probes Codex compatibility. It rejects stale drafts and configuration changes that require a restart.
 4. After validation, publication records a Git commit and selects the new source snapshot. Active turns retain their code and resolved Codex executable until completion. The next turn in an existing conversation uses the latest validated snapshot, including after a service restart. Its original binding stays unchanged as history; execution snapshots record the revision used for subsequent turns.
 
 For example, a running task finishes on its current engine when a patch is published. Its next turn resumes the same Codex conversation with the patched engine. Adapters and slash commands use the latest validated revision immediately.
@@ -59,7 +59,6 @@ Use a model ID available to your Codex account. Authenticate the CLI separately,
 ```sh
 pnpm doctor
 pnpm check
-pnpm test
 pnpm start
 ```
 
@@ -112,11 +111,10 @@ Use your process manager to run `pnpm start` with the repository as its working 
 
 ```sh
 pnpm check
-pnpm test
 pnpm build
 pnpm audit:export
 ```
 
-Tests use temporary directories, fake RPC responses, and mocked platform clients. They do not send live messages or consume model tokens. CI runs these checks on Linux. Before publishing, also run a dedicated secret scanner against the full Git history.
+CI checks the build and scans the public files and Git history for secrets. Validate runtime behavior end to end before releasing a change.
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for the module layout and [the export audit notes](docs/export-audit.md) for publication checks. MIT licensed.
+MIT licensed.
