@@ -70,6 +70,23 @@ test('worktrees isolate parallel tasks and reject a project outside its workspac
   assert.equal(createWorktree(config,'default','a',repo).reused,true);
   assert.throws(()=>createWorktree(config,'default','c',dir),/inside/);
 });
+test('cleaned worktrees reopen their retained branch and ignore missing registrations',t=>{
+  const {config}=setup(t);const repo=config.workspaces.default;mkdirSync(repo);
+  const git=(...args:string[])=>execFileSync('git',['-C',repo,...args],{encoding:'utf8'});
+  git('init');git('config','user.email','test@example.com');git('config','user.name','Test');
+  writeFileSync(join(repo,'file.txt'),'base');git('add','.');git('commit','-m','initial');
+  const a=createWorktree(config,'default','a',repo);
+  writeFileSync(join(a.path,'file.txt'),'task work');
+  execFileSync('git',['-C',a.path,'commit','-am','task commit']);
+  const taskHead=execFileSync('git',['-C',a.path,'rev-parse','HEAD'],{encoding:'utf8'}).trim();
+  git('worktree','remove',a.path);
+  writeFileSync(join(repo,'file.txt'),'new base');git('commit','-am','base moved');
+  const reopened=createWorktree(config,'default','a',repo);
+  assert.equal(readFileSync(join(reopened.path,'file.txt'),'utf8'),'task work');
+  assert.equal(execFileSync('git',['-C',reopened.path,'rev-parse','HEAD'],{encoding:'utf8'}).trim(),taskHead);
+  const stale=createWorktree(config,'default','stale',repo);rmSync(stale.path,{recursive:true,force:true});
+  assert.equal(createWorktree(config,'default','a',repo).reused,true);
+});
 class FakeRpc extends EventEmitter {
   calls:any[]=[];turn='turn';failSteer=false;
   async initialize(){}
@@ -114,4 +131,21 @@ test('route selection prefers exact guild and replies respect length limits',()=
   const config={routes:[{account:'default',guild:'*',channel:'x',model:'a'},{account:'default',guild:'guild',channel:'x',model:'b'}]} as Config;
   assert.equal(routeFor(config,'default','guild','x')!.model,'b');assert.equal(routeFor(config,'secondary','guild','x'),undefined);
   const text='hello\n'.repeat(1000);assert.ok(splitMessage(text).every(s=>s.length<=1900));
+});
+
+test('speed preference applies on the next resumed turn and scheduled tasks inherit it',async t=>{
+ const {config,store,task,cleanup}=setup(t),rpcs:FakeRpc[]=[];
+ const engine=new Engine(config,store,()=>{const rpc=new FakeRpc();rpcs.push(rpc);return rpc as any;});engine.sender=async()=> 'sent';cleanup.push(()=>engine.shutdown());
+ store.meta(`taskServiceTier:${task.key}`,'ultrafast');
+ await engine.submit(task,'first','start');await settle();
+ assert.equal(rpcs[0].calls.find(c=>c.method==='turn/start').params.serviceTier,'ultrafast');
+ store.meta(`taskServiceTier:${task.key}`,'default');
+ assert.equal(rpcs[0].calls.find(c=>c.method==='turn/start').params.serviceTier,'ultrafast');
+ rpcs[0].complete();await settle();await engine.submit(task,'second','resume');await settle();
+ assert.equal(rpcs[1].calls[0].method,'thread/resume');assert.equal(rpcs[1].calls.find(c=>c.method==='turn/start').params.serviceTier,'default');
+ rpcs[1].complete();await settle();
+ const scheduled={...store.task(task.key)!,key:'scheduled:speed',thread:null};
+ store.meta(`scheduleRun:${scheduled.key}`,{origin:task.key});store.meta(`taskServiceTier:${task.key}`,'ultrafast');
+ await engine.submit(scheduled,'scheduled','run');await settle();
+ assert.equal(rpcs[2].calls.find(c=>c.method==='turn/start').params.serviceTier,'ultrafast');
 });

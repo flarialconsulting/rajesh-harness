@@ -6,7 +6,6 @@ import { Store } from './store.js';
 import { Engine } from './engine.js';
 import { Revisions } from './revisions.js';
 import { Runtime } from './runtime.js';
-import { ModelCommands } from './models.js';
 import { Skills } from './skills.js';
 import { Schedules } from './schedules.js';
 import { Progress } from './progress.js';
@@ -45,7 +44,7 @@ async function adaptersFor(revision:typeof first) {
   })();adapters.set(revision.id,promise);}
   const pair=await promise;pair.whatsapp.socket=whatsapp.socket;return pair;
 }
-// Only this bootstrap owns gateway/session connections; task behavior comes from saved source revisions.
+// Bootstrap owns connections; adapters update immediately and engines update between turns.
 discord.receive=async(account:string,m:any)=>{
   const client=discord.clients.get(account);
   if(client?.user&&await discordReplyToBot(m,client.user.id))m.mentions.users.set(client.user.id,client.user);
@@ -105,7 +104,7 @@ const control=createServer(async(req,res)=>{
       else throw new Error('Unknown skills action');
     }
     else if(input.action==='schedule')result=schedules.command(store.task(input.task)!,input.input);
-    else if(input.action==='status')result={...store.meta('runtime'),binding:runtime.binding(input.task),sharedRuntime:store.meta('sharedRuntime'),source,active:runtime.active,restartRequired:restartRequired()};
+    else if(input.action==='status')result={...store.meta('runtime'),binding:runtime.binding(input.task),execution:runtime.execution(input.task),policy:'latest-between-turns',sharedRuntime:store.meta('sharedRuntime'),source,active:runtime.active,restartRequired:restartRequired()};
     else if(input.action==='prepare')result=revisions.prepare(input.task);
     else if(input.action==='publish')result=await revisions.publish(input.task,input.path);
     else throw new Error('Unknown runtime action');
@@ -115,16 +114,30 @@ const control=createServer(async(req,res)=>{
 await new Promise<void>(resolve=>control.listen(socketPath,()=>{chmodSync(socketPath,0o600);resolve();}));
 const secrets=existsSync(join(config.secretsDir,'credentials.json'))?JSON.parse(readFileSync(join(config.secretsDir,'credentials.json'),'utf8')):{discord:{}};
 await discord.start(secrets.discord ?? {});if(config.whatsappGroup)whatsapp.start();
-for(const [account,client] of discord.clients as Map<string,any>) {
-  client.on('interactionCreate',(i:any)=>{void new ModelCommands(runtime.currentConfig??config,store).interaction(account,i,key=>runtime.stopTask(key)).catch(e=>console.error('model_command_failed',redact(e.message)));});
-  const register=()=>{const current=runtime.currentConfig??config;void new ModelCommands({...current,routes:current.routes.filter(r=>r.account===account)},store).register(client).catch(e=>console.error('model_registration_failed',redact(e.message)));};
-  if(client.isReady())register();else client.once('clientReady',register);
+async function registerModels(revision:typeof first) {
+  const modules=await runtime.load(revision);
+  for(const [account,client] of discord.clients as Map<string,any>) {
+    if(client.isReady())await new modules.models.ModelCommands({...modules.config,routes:modules.config.routes.filter((r:any)=>r.account===account)},store).register(client);
+  }
 }
+for(const [account,client] of discord.clients as Map<string,any>) {
+  client.on('interactionCreate',(i:any)=>{void (async()=>{
+    if(!i.isChatInputCommand())return;
+    await i.deferReply({flags:64}); // Publication validation may exceed Discord's acknowledgement deadline.
+    const modules=await runtime.load(await runtime.latest());
+    const taskKey=i.channel?.isThread()?`discord:${account}:${i.channelId}`:undefined;
+    const engine=taskKey&&store.task(taskKey)?await runtime.get(store.task(taskKey)!):undefined;
+    await new modules.models.ModelCommands({...modules.config,codex:engine?.config.codex??modules.config.codex},store).interaction(account,i,(key:string)=>runtime.stopTask(key));
+  })().catch(async e=>{console.error('model_command_failed',redact(e.message));if(i.deferred)await i.editReply('Could not load or change the model. Please retry.').catch(()=>{});});});
+  if(!client.isReady())client.once('clientReady',()=>{void runtime.latest().then(registerModels).catch(e=>console.error('model_registration_failed',redact(e.message)));});
+}
+let registeredRevision='';
 let refreshing=false;
 const watcher=setInterval(()=>{
   if(refreshing)return;refreshing=true;
   void runtime.latest().then(async revision=>{
     const modules=await runtime.load(revision);runtime.currentConfig=modules.config;discord.config=modules.config;
+    if(registeredRevision!==revision.id){await registerModels(revision);registeredRevision=revision.id;}
   }).catch(e=>store.meta('runtimeFailure',{error:redact(e.message),time:Date.now()})).finally(()=>{refreshing=false;});
 },2000);
 const tick=setInterval(()=>{

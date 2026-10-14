@@ -23,7 +23,10 @@ function fixture(t:any) {
   const engine=(marker:string)=>`import {Engine as Base} from ${JSON.stringify(engineUrl)}; export class Engine extends Base {marker=${JSON.stringify(marker)}}`;
   writeFileSync(join(source,'src','engine.ts'),engine('A'));
   writeFileSync(join(source,'src','store.ts'),`export {Store} from ${JSON.stringify(storeUrl)}`);
-  for(const name of ['discord','whatsapp'])writeFileSync(join(source,'src',name+'.ts'),'export {}');
+  for(const [name,exported] of [['discord','DiscordAdapter'],['whatsapp','WhatsAppAdapter'],['models','ModelCommands']]) {
+    const url=pathToFileURL(fileURLToPath(new URL('../src/'+name+'.ts',import.meta.url))).href;
+    writeFileSync(join(source,'src',name+'.ts'),`export {${exported}} from ${JSON.stringify(url)}`);
+  }
   writeFileSync(join(source,'src','redact.ts'),'export function loadRedactions(){}');
   const store=new Store(data),reports:any[]=[];
   const revisions=new Revisions(source,config,v=>reports.push(v));
@@ -41,19 +44,25 @@ class FakeRpc extends EventEmitter {
 }
 const settle=()=>new Promise(r=>setTimeout(r,40));
 
-test('published TS modules and config stay pinned across edits and runtime reconstruction',async t=>{
-  const f=fixture(t);const a=await f.runtime.latest(),old=f.task('old');f.store.saveTask(old);
+test('idle persistent chats adopt patches and restart on current code while preserving original bindings',async t=>{
+  const f=fixture(t);const a=await f.runtime.latest(),old=f.task('old');
+  old.thread='existing-history';old.effort='high';f.store.saveTask(old);
   const before=await f.runtime.get(old,a);assert.equal((before as any).marker,'A');
-  const pinnedBinary=before.config.codex;
+  const original=f.runtime.binding(old.key)!;const saved=readFileSync(original.configPath,'utf8');
   const newBinary=join(f.root,'new-codex');writeFileSync(newBinary,'placeholder');
   writeFileSync(join(f.source,'config.json'),JSON.stringify({...f.config,codex:newBinary,concurrency:2}));
   writeFileSync(join(f.source,'src','engine.ts'),f.engine('B'));
   const b=await f.runtime.latest();assert.notEqual(a.id,b.id);
-  assert.equal((await f.runtime.get(old) as any).marker,'A');assert.equal(before.config.codex,pinnedBinary);
-  const fresh=f.task('fresh');f.store.saveTask(fresh);const after=await f.runtime.get(fresh,b);
-  assert.equal((after as any).marker,'B');assert.equal(after.config.codex,newBinary);
+  assert.equal((await f.runtime.forTask(old.key)).id,b.id);
+  const [after,duplicate]=await Promise.all([f.runtime.get(old,a),f.runtime.get(old)]);
+  assert.equal(after,duplicate);assert.notEqual(before,after);assert.equal((after as any).marker,'B');
+  assert.equal(after.config.codex,newBinary);assert.equal(before.canStart(),false);
+  assert.deepEqual({...f.store.task(old.key)},old);
+  assert.deepEqual(f.runtime.binding(old.key),original);assert.equal(readFileSync(original.configPath,'utf8'),saved);
+  assert.equal(f.runtime.execution(old.key)!.revision,b.id);
   const reconstructed=new Runtime(new Revisions(f.source,f.config,()=>{}),f.store);
-  const resumed=await reconstructed.get(old);assert.equal((resumed as any).marker,'A');assert.equal(resumed.config.codex,pinnedBinary);
+  const resumed=await reconstructed.get(old);assert.equal((resumed as any).marker,'B');
+  assert.equal(f.store.task(old.key)!.thread,'existing-history');assert.equal(resumed.config.codex,newBinary);
   await reconstructed.shutdown();for(const modules of reconstructed.modules.values())(await modules).store.close();
 });
 
@@ -99,7 +108,9 @@ test('isolated engines share the global concurrency limit and active old turns s
   assert.equal(f.runtime.active,1);assert.equal(e2.running.size,0);assert.equal(f.store.pending().length,1);
   writeFileSync(join(f.source,'src','engine.ts'),f.engine('B'));await f.runtime.latest();
   assert.equal(e1.running.size,1);assert.equal((e1 as any).marker,'A');
-  rpc1.complete();await settle();await f.runtime.drain();await settle();assert.equal(e2.running.size,1);assert.equal(f.runtime.active,1);
+  rpc1.complete();await settle();
+  const upgraded=await f.runtime.get(two);upgraded.rpcFactory=()=>rpc2 as any;
+  await f.runtime.drain();await settle();assert.equal(e2.running.size,0);assert.equal(upgraded.running.size,1);assert.equal((upgraded as any).marker,'B');assert.equal(f.runtime.active,1);
 });
 
 
@@ -113,4 +124,89 @@ test('/stop force-closes only its task, cancels queued input and allows a new pr
  assert.equal(f.store.db.prepare('SELECT state FROM jobs WHERE task=?').get(two.key)!.state,'queued');
  rpc.complete();await settle();assert.equal(f.store.task(one.key)!.status,'interrupted');
  e1.rpcFactory=()=>new FakeRpc() as any;await e1.submit(one,'new','try again');await settle();assert.equal(e1.running.size,1);assert.equal(f.store.task(one.key)!.thread,'conversation');
+});
+
+test('publication preserves active steering but queued turns resume history on the latest engine exactly once',async t=>{
+  const f=fixture(t),a=await f.runtime.latest(),task=f.task('persistent');f.store.saveTask(task);
+  const engine=await f.runtime.get(task,a),oldRpc=new FakeRpc();engine.rpcFactory=()=>oldRpc as any;
+  await engine.submit(task,'first','go');await settle();
+  writeFileSync(join(f.source,'src','engine.ts'),f.engine('B'));const b=await f.runtime.latest();
+  assert.equal(await f.runtime.get(task),engine);
+  assert.equal((await f.runtime.forTask(task.key)).id,b.id);
+  await f.runtime.facade(a).submit(task,'steer','follow up');await settle();
+  assert.equal(engine.running.get(task.key)!.jobs.length,2);
+  f.store.enqueue(task.key,'queued','next turn');
+  oldRpc.complete();await settle();
+  assert.equal(engine.running.size,0);assert.equal(f.store.pending().length,1);
+  assert.equal(engine.canStart(),false);
+  const current=await f.runtime.get(task),calls:string[]=[];
+  const rpc=new FakeRpc();rpc.request=async(method:string)=>{calls.push(method);return method.startsWith('thread/')?{thread:{id:'conversation'}}:{turn:{id:'turn'}};};
+  current.rpcFactory=()=>rpc as any;
+  await Promise.all([f.runtime.drain(),f.runtime.drain()]);await settle();
+  assert.equal((current as any).marker,'B');assert.equal(calls[0],'thread/resume');
+  assert.equal(calls.filter(c=>c==='turn/start').length,1);
+  assert.equal(f.store.task(task.key)!.thread,'conversation');
+  assert.equal(f.store.db.prepare("SELECT count(*) n FROM jobs WHERE state='done'").get()!.n,2);
+});
+
+test('invalid publications leave existing chats and adapters on the last working revision',async t=>{
+  const f=fixture(t),a=await f.runtime.latest(),task=f.task('unchanged');f.store.saveTask(task);
+  const engine=await f.runtime.get(task);
+  writeFileSync(join(f.source,'src','engine.ts'),'BROKEN');
+  assert.equal((await f.runtime.forTask(task.key)).id,a.id);
+  assert.equal(await f.runtime.get(task),engine);assert.equal(engine.canStart(),true);
+  assert.equal(f.runtime.execution(task.key)!.revision,a.id);
+});
+
+for(const platform of ['whatsapp','discord'])test(`${platform} existing chats use new adapters and commands without clearing history`,async t=>{
+  const f=fixture(t);
+  f.config.routes=[{account:'default',workspace:'default',guild:'guild',channel:'channel',model:'model',effort:'low'}];
+  writeFileSync(join(f.source,'config.json'),JSON.stringify(f.config));
+  const task=f.task(platform==='discord'?'discord:default:persistent':'whatsapp:group@g.us');
+  task.platform=platform;task.thread='existing-history';
+  if(platform==='whatsapp'){task.channel=f.config.whatsappGroup;task.parent=f.config.whatsappGroup;}
+  f.store.saveTask(task);await f.runtime.get(task);
+  writeFileSync(join(f.source,'src','engine.ts'),f.engine('B'));const b=await f.runtime.latest();
+  const modules=await f.runtime.load(await f.runtime.forTask(task.key));
+  const facade=f.runtime.facade(b);
+  if(platform==='whatsapp') {
+    const adapter=new modules.whatsapp.WhatsAppAdapter(f.config,f.store,facade);
+    adapter.socket={user:{id:'999@s.whatsapp.net'}};
+    await adapter.receive({key:{id:'status',remoteJid:task.channel},message:{extendedTextMessage:{text:'/status',contextInfo:{mentionedJid:['999@s.whatsapp.net']}}}},true);
+    assert.match(String(f.store.db.prepare('SELECT text FROM deliveries WHERE task=?').get(task.key)!.text),/Model: model/);
+    assert.equal(f.store.pending().length,0);
+  }else {
+    const adapter=new modules.discord.DiscordAdapter(f.config,f.store,facade);
+    adapter.clients.set('default',{user:{id:'bot'}});
+    await adapter.receive('default',{id:'status',guildId:'guild',channelId:'persistent',content:'<@bot> /status',author:{id:'human',displayName:'Human',bot:false},createdTimestamp:1,mentions:{users:{has:()=>true}},attachments:new Map(),channel:{isThread:()=>true,parentId:'channel'}});
+    assert.equal(f.store.pending().length,0);
+    assert.match(String(f.store.db.prepare('SELECT text FROM deliveries WHERE task=?').get(task.key)!.text),/Model: model/);
+  }
+  assert.equal((await f.runtime.get(task) as any).marker,'B');
+  assert.equal(f.store.task(task.key)!.thread,'existing-history');
+  assert.equal(f.runtime.binding(task.key)!.revision===b.id,false);
+});
+
+test('new command code is available during an old active turn without replacing its engine',async t=>{
+  const f=fixture(t),a=await f.runtime.latest(),task=f.task('active-command');f.store.saveTask(task);
+  const engine=await f.runtime.get(task,a),rpc=new FakeRpc();engine.rpcFactory=()=>rpc as any;
+  await engine.submit(task,'first','go');await settle();
+  const updated=f.engine('B').slice(0,-1)+`; async command(task,text,id){if(text==='/patched'){await this.tell(task,this.running.has(task.key)?'patched while running':'patched',id);return true;}return super.command(task,text,id);} }`;
+  writeFileSync(join(f.source,'src','engine.ts'),updated);await f.runtime.latest();
+  assert.equal(await f.runtime.facade(a).command(task,'/patched','patched-command'),true);
+  assert.equal(await f.runtime.get(task),engine);assert.equal(engine.running.size,1);
+  assert.equal(f.store.db.prepare("SELECT text FROM deliveries WHERE id='patched-command'").get()!.text,'patched while running');
+  assert.equal(f.store.task(task.key)!.thread,'conversation');
+});
+
+test('a validated source rollback applies between turns without rewriting chat state or snapshots',async t=>{
+  const f=fixture(t),a=await f.runtime.latest(),task=f.task('rollback');task.thread='history';f.store.saveTask(task);
+  await f.runtime.get(task);const original=f.runtime.binding(task.key)!;
+  writeFileSync(join(f.source,'src','engine.ts'),f.engine('B'));await f.runtime.latest();
+  const next=await f.runtime.get(task);assert.equal((next as any).marker,'B');
+  const saved=readFileSync(f.runtime.execution(task.key)!.configPath,'utf8');
+  writeFileSync(join(f.source,'src','engine.ts'),f.engine('A'));assert.equal((await f.runtime.latest()).id,a.id);
+  assert.equal((await f.runtime.get(task) as any).marker,'A');assert.equal(next.canStart(),false);
+  assert.equal(f.store.task(task.key)!.thread,'history');assert.deepEqual(f.runtime.binding(task.key),original);
+  assert.equal(readFileSync(next.config.runtime!.configPath,'utf8'),saved);
 });

@@ -1,3 +1,4 @@
+import { timing } from './latency.js';
 import { Client, GatewayIntentBits, Partials, ChannelType, type Message as DiscordMessage } from 'discord.js';
 import type { Config, Workspace } from './config.js';
 import { routeFor } from './config.js';
@@ -87,12 +88,20 @@ export class DiscordAdapter {
       this.store.db.prepare("INSERT OR IGNORE INTO origins VALUES (?,NULL,'creating')").run(`${account}:${m.id}`);
       let thread=m.thread;
       if(!thread) {
-        try {const fetched=await client.channels.fetch(m.id);if(fetched?.isThread())thread=fetched;}catch{}
+        try {const fetched=await client.channels.fetch(m.id,{force:true});if(fetched?.isThread())thread=fetched;}catch{}
       }
-      if(!thread)thread=await m.startThread({name:(m.content.replace(/<@!?\d+>/g,'').trim()||'New task').slice(0,90),autoArchiveDuration:1440});
+      if(!thread) {
+        try {thread=await m.startThread({name:(m.content.replace(/<@!?\d+>/g,'').trim()||'New task').slice(0,90),autoArchiveDuration:1440});}
+        catch(e:any) {
+          if(e.code!==160004)throw e;
+          const existing=await client.channels.fetch(m.id,{force:true});
+          if(!existing?.isThread())throw e;
+          thread=existing;
+        }
+      }
       const key=`discord:${account}:${thread.id}`;
       const preferred=this.store.meta(`modelDefault:discord:${account}:${parent}`)??route;
-      task={key,workspace:route.workspace,platform:'discord',account,channel:thread.id,parent,model:preferred.model,effort:preferred.effort,thread:null,cwd:taskDirectory(this.config,key),status:'queued'};
+      task=this.store.task(key)??{key,workspace:route.workspace,platform:'discord',account,channel:thread.id,parent,model:preferred.model,effort:preferred.effort,thread:null,cwd:taskDirectory(this.config,key),status:'queued'};
       this.store.db.prepare("UPDATE origins SET thread=?,state='created' WHERE id=?").run(thread.id,`${account}:${m.id}`);
       // Fetch context at invocation time, including messages missed during a short reconnect.
       if('messages' in m.channel) {
@@ -127,12 +136,23 @@ export class DiscordAdapter {
   }
   async send(task:Task,text:string,id:string) {
     if(text.trim()==='NO_REPLY')return '';
+    const started=performance.now();
+    try {
+      const result=await this.sendNow(task,text,id);
+      timing(this.store,task,null,'discord_delivery',performance.now()-started,{status:'sent'});
+      return result;
+    }catch(e:any){
+      timing(this.store,task,null,'discord_delivery',performance.now()-started,{status:'failed',notSent:e.notSent===true});
+      throw e;
+    }
+  }
+  private async sendNow(task:Task,text:string,id:string) {
     const client=this.clients.get(task.account);if(!client?.isReady())throw Object.assign(new Error('Discord is disconnected'),{notSent:true});
     const channel=await client.channels.fetch(task.channel);
     if(!channel?.isSendable())throw new Error('Discord channel is not sendable');
     if(channel.isThread()&&channel.archived)await channel.setArchived(false);
     const run=this.store.meta(`scheduleRun:${task.key}`);
-    const mentionIds=run?.mentionUserIds;
+    const mentionIds=this.store.meta(`deliveryMentions:${id}`)?.users??run?.mentionUserIds;
     const users=Array.isArray(mentionIds)?mentionIds.filter((user:any)=>typeof user==='string'&&/^\d{17,20}$/.test(user)):[];
     const allowedMentions=users.length?{parse:[] as ('users'|'roles'|'everyone')[],users}:{parse:[] as ('users'|'roles'|'everyone')[]};
     const upload=decodeUpload(text,id);

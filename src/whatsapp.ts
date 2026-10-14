@@ -1,3 +1,5 @@
+import { timing } from './latency.js';
+import type { FinalReply } from './final-replies.js';
 import makeWASocket, { BufferJSON, downloadMediaMessage, proto, initAuthCreds, jidNormalizedUser, normalizeMessageContent, DisconnectReason, type AuthenticationState, type WASocket, type WAMessage } from 'baileys';
 import pino from 'pino';
 import { existsSync, readdirSync, readFileSync } from 'node:fs';
@@ -154,13 +156,31 @@ export class WhatsAppAdapter {
     for(const row of rows)this.serial=this.serial.then(()=>this.receive(JSON.parse(row.payload,BufferJSON.reviver),true)).catch(e=>console.error('whatsapp_retry_failed',redact(e.message)));
   }
   async send(task:Task,text:string,id:string) {
+    const started=performance.now();
+    try {
+      const result=await this.sendNow(task,text,id);
+      timing(this.store,task,null,'whatsapp_delivery',performance.now()-started,{status:'sent'});
+      return result;
+    }catch(e:any){
+      timing(this.store,task,null,'whatsapp_delivery',performance.now()-started,{status:'failed',notSent:e.notSent===true});
+      throw e;
+    }
+  }
+  private async sendNow(task:Task,text:string,id:string) {
     if(!this.store.meta('whatsapp')?.ready||!this.socket)throw Object.assign(new Error('WhatsApp disconnected'),{notSent:true});
+    const run=this.store.meta(`scheduleRun:${task.key}`);
+    const mentions=(this.store.meta(`deliveryMentions:${id}`)?.users??run?.mentionUserIds??[]).filter((jid:unknown)=>typeof jid==='string'&&/^\d+@(?:lid|s\.whatsapp\.net)$/.test(jid));
+    const target=this.store.meta(`finalReply:${id}`) as FinalReply|undefined;
+    const quoted=target?.raw&&target.channel===task.channel?JSON.parse(target.raw,BufferJSON.reviver) as WAMessage:undefined;
+    const sender=quoted?.key.participant??quoted?.key.remoteJid;
+    const user=sender?jidNormalizedUser(sender):undefined;
+    const finalMentions=[...new Set([...mentions,...(user&&/^\d+@(?:lid|s\.whatsapp\.net)$/.test(user)?[user]:[])])];
     const upload=decodeUpload(text,id);
     if(upload){
       const messageId=createHash('sha256').update(id).digest('hex').slice(0,32).toUpperCase();
       const inline=upload.presentation!=='document'&&['image/png','image/jpeg'].includes(upload.mime);
       const content=inline?{image:{url:upload.path},mimetype:upload.mime,caption:upload.caption}:{document:{url:upload.path},fileName:upload.name,mimetype:upload.mime,caption:upload.caption};
-      const message=await this.socket.sendMessage(task.channel,content,{messageId});
+      const message=await this.socket.sendMessage(task.channel,{...content,mentions},{messageId});
       if(!message?.key.id)throw new Error('Upload delivery was not acknowledged');
       return message.key.id;
     }
@@ -168,7 +188,9 @@ export class WhatsAppAdapter {
     for(const [index,content] of splitMessage(text,3500).entries()) {
       const {createHash}=await import('node:crypto');
       const messageId=createHash('sha256').update(id+':'+index).digest('hex').slice(0,32).toUpperCase();
-      const m=await this.socket.sendMessage(task.channel,{text:content},{messageId});ids.push(m?.key.id??messageId);
+      const first=index===0;
+      const body=first&&user&&finalMentions.includes(user)?`@${user.split('@')[0]} ${content}`:content;
+      const m=await this.socket.sendMessage(task.channel,{text:body,mentions:first?finalMentions:mentions},{messageId,...(first&&quoted?{quoted}:{})});ids.push(m?.key.id??messageId);
     }
     return ids.join(',');
   }

@@ -120,7 +120,7 @@ test('Discord steering deletes the old log and creates an empty log below the ne
  input('steer');await progress.flush();assert.deepEqual(deleted,['1']);assert.equal(messages.size,1);assert.ok(!messages.get('2').content.includes('old-command'));
  input('steer');await progress.flush();assert.equal(next,2);
  progress.event(task,'tool',{id:'new',type:'commandExecution',command:'new-command'});await progress.flush();assert.match(messages.get('2').content,/new-command/);
- await progress.final(task,'Finished','codex:done');input('next-turn');await progress.flush();assert.equal(messages.get('2').content,'Finished');assert.equal(messages.size,2);
+ await progress.final(task,'Finished','codex:done');assert.ok(!messages.has('2'));assert.equal(messages.get('3').content,'Finished');assert.deepEqual(messages.get('3').reply,{messageReference:'first',failIfNotExists:false});input('next-turn');await progress.flush();assert.equal(messages.get('3').content,'Finished');assert.equal(messages.size,2);
 });
 
 test('steering during an in-flight log creation removes it after delivery',async t=>{

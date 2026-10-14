@@ -15,9 +15,10 @@ export function createWorktree(config:Config,workspace:Workspace,taskKey:string,
   const path=join(base,id),branch=`rajesh/${id}`;
   if(existsSync(path)) {
     const all=git('worktree','list','--porcelain');
-    if(!all.split('\n').filter(line=>line.startsWith('worktree ')).some(line=>realpathSync(line.slice(9))===realpathSync(path))) throw new Error('Existing path is not a registered worktree');
+    if(!all.split('\n').filter(line=>line.startsWith('worktree ')).some(line=>existsSync(line.slice(9))&&realpathSync(line.slice(9))===realpathSync(path))) throw new Error('Existing path is not a registered worktree');
     return {path,branch,reused:true};
   }
-  git('worktree','add','-b',branch,path,'HEAD');
+  if(git('branch','--list',branch)) git('worktree','add',path,branch);
+  else git('worktree','add','-b',branch,path,'HEAD');
   return {path,branch,reused:false};
 }

@@ -1,5 +1,7 @@
 import { Store,type Task,eventId } from './store.js';
 import { redact } from './redact.js';
+import { timing,ensureLatencyStorage } from './latency.js';
+import { rememberFinalReply,sendDiscordFinal } from './final-replies.js';
 const toolTypes=new Set(['commandExecution','fileChange','mcpToolCall','dynamicToolCall','webSearch','imageView','imageGeneration','collabAgentToolCall','computerUse','toolCall']);
 export function toolLine(item:any) {
   const detail=item.command??(item.tool?`${item.server??''}/${item.tool} ${JSON.stringify(item.arguments??{})}`:item.query??item.action?.query??item.changes?.map((c:any)=>c.path).join(', ')??item.path??'');
@@ -7,16 +9,20 @@ export function toolLine(item:any) {
   return text.length>65?text.slice(0,64)+'…':text;
 }
 export function renderTools(rows:{line:string;status:string}[],count:number,state:string) {
+  if(state==='queued'&&!count)return 'Queued. Waiting for an available task slot.';
   const header=count>25?`${count-25} more tool calls ...\n`:'';
   const icon=state==='completed'?'✅':state==='failed'?'❌':state==='interrupted'?'⏹️':'🛠️';
   return `${header}${icon} Tool activity\n`+rows.slice(-25).map(r=>`${r.status==='completed'?'✓':r.status==='failed'?'✗':'…'} ${r.line}`).join('\n');
 }
 export class Progress {
   clients=new Map<string,any>();socket:()=>any=()=>undefined;flushing=false;pendingFlush?:Promise<void>;
+  nextAttempt=new Map<string,number>();
+  lastFlushAt=0;
   constructor(public store:Store) {
     store.db.exec(`CREATE TABLE IF NOT EXISTS tool_activity(task TEXT,item TEXT,line TEXT,status TEXT,PRIMARY KEY(task,item));
       CREATE TABLE IF NOT EXISTS progress_panels(task TEXT PRIMARY KEY,message TEXT,state TEXT,dirty INTEGER,creating INTEGER DEFAULT 0);
       CREATE TABLE IF NOT EXISTS progress_reactions(task TEXT,message TEXT PRIMARY KEY,key TEXT,state TEXT,sent TEXT);`);
+    ensureLatencyStorage(store);
   }
   panel(task:Task) {
     let key=this.store.meta(`panel:${task.key}`) as string|undefined;
@@ -26,13 +32,31 @@ export class Progress {
   }
   captureFinal(task:Task,text:string,id:string) {
     if(!text.trim()||this.store.meta(`finalPanel:${id}`))return;
+    // Active turns can still use the engine from before this patch was published.
+    if(id.startsWith('codex:')&&!this.store.meta(`finalReply:${id}`)) {
+      const job=this.store.db.prepare("SELECT id FROM jobs WHERE task=? AND state='running' ORDER BY id LIMIT 1").get(task.key);
+      if(job)rememberFinalReply(this.store,task,id,Number(job.id));
+    }
     const key=this.panel(task);
     this.store.meta(`finalPanel:${id}`,key);
+    if(this.store.meta(`finalReply:${id}`)) {
+      this.store.meta(`panelNativeFinal:${key}`,id);
+      this.store.db.prepare("UPDATE progress_panels SET state='retired',dirty=1 WHERE task=?").run(key);
+      return;
+    }
     this.store.meta(`panelFinal:${key}`,redact(text));
+    this.nextAttempt.delete(key);
     this.store.db.prepare('UPDATE progress_panels SET dirty=1 WHERE task=?').run(key);
   }
   async final(task:Task,text:string,id:string):Promise<string> {
+    if(text.trim()==='NO_REPLY')return '';
     this.captureFinal(task,text,id);
+    if(this.store.meta(`finalReply:${id}`)) {
+      await this.pendingFlush;
+      const sent=await sendDiscordFinal(this.store,task,redact(text),id,this.clients);
+      await this.flush();
+      return sent;
+    }
     await this.pendingFlush;await this.flush();
     const key=this.store.meta(`finalPanel:${id}`);
     const panel=this.store.db.prepare('SELECT * FROM progress_panels WHERE task=?').get(key) as any;
@@ -56,14 +80,14 @@ export class Progress {
       if(!added.changes)return;
       if(task.platform==='discord') {
         const previous=this.store.meta(`panel:${task.key}`);
-        if(previous&&this.store.meta(`panelFinal:${previous}`)===undefined) {
+        if(previous&&this.store.meta(`panelFinal:${previous}`)===undefined&&!this.store.meta(`panelNativeFinal:${previous}`)) {
           this.store.db.prepare("UPDATE progress_panels SET state='retired',dirty=1 WHERE task=?").run(previous);
         }
         const next=`${task.key}:input:${message}`;
         this.store.meta(`panel:${task.key}`,next);this.panel(task);
-        this.store.db.prepare('UPDATE progress_panels SET dirty=1 WHERE task=?').run(next);
+        this.store.db.prepare("UPDATE progress_panels SET state='queued',dirty=1 WHERE task=?").run(next);
       }
-      // A new steering message takes ownership of the result. Keep this terminal
+      // A steering message takes ownership of the activity panel. Keep this terminal
       // state even when all jobs in the shared turn later complete together.
       this.store.db.prepare(`UPDATE progress_reactions SET state='superseded'
         WHERE task=? AND message!=? AND state!='superseded'
@@ -73,10 +97,11 @@ export class Progress {
   event(task:Task,kind:string,item?:any) {
     if(task.platform==='discord'&&kind==='started') {
       const current=this.store.meta(`panel:${task.key}`) as string|undefined;
-      if(current?.includes(':input:')&&this.store.meta(`panelFinal:${current}`)===undefined)return;
+      if(current?.includes(':input:')&&this.store.meta(`panelFinal:${current}`)===undefined&&!this.store.meta(`panelNativeFinal:${current}`))return;
       this.store.meta(`panel:${task.key}`,`${task.key}:turn:${item.id}`);this.panel(task);return;
     }
     const key=task.platform==='discord'?this.panel(task):task.key;
+    if(task.platform==='discord'&&this.store.meta(`panelNativeFinal:${key}`))return;
     if(kind==='tool') {
       if(task.platform==='discord'&&item?.type==='agentMessage'&&item.phase==='commentary'&&item.status==='completed') {
         if(!item.id||!item.text?.trim())return;
@@ -104,6 +129,9 @@ export class Progress {
   }
   private async flushNow() {
     this.flushing=true;
+    const flushStarted=performance.now();
+    if(this.lastFlushAt&&flushStarted-this.lastFlushAt>10_000)this.store.meta('progressTickGap',{gapMs:Math.round(flushStarted-this.lastFlushAt),time:Date.now()});
+    this.lastFlushAt=flushStarted;
     try {
       this.store.db.exec(`UPDATE progress_reactions SET state=CASE (SELECT state FROM jobs WHERE jobs.message=progress_reactions.message)
         WHEN 'queued' THEN 'seen' WHEN 'running' THEN 'working' WHEN 'steering' THEN 'working' WHEN 'done' THEN 'completed'
@@ -132,11 +160,13 @@ export class Progress {
           this.store.db.prepare('UPDATE progress_reactions SET sent=? WHERE message=?').run(row.state,row.message);
         }catch{continue;}
       }
-      const panels=this.store.db.prepare('SELECT * FROM progress_panels WHERE dirty=1').all() as any[];
+      const panels=this.store.db.prepare('SELECT * FROM progress_panels WHERE dirty=1 ORDER BY rowid DESC').all() as any[];
       for(const panel of panels) {
+        if((this.nextAttempt.get(panel.task)??0)>Date.now())continue;
         const task=this.store.task(this.store.meta(`panelTask:${panel.task}`)??panel.task);if(!task)continue;
         const client=this.clients.get(task.account);if(!client?.isReady())continue;
         try {
+          const panelStarted=performance.now();
           const channel=await client.channels.fetch(task.channel);if(!channel?.isSendable())continue;
           if(channel.isThread()&&channel.archived)await channel.setArchived(false);
           const latest=this.store.db.prepare('SELECT * FROM progress_panels WHERE task=?').get(panel.task) as any;
@@ -146,7 +176,7 @@ export class Progress {
               const nonce=BigInt('0x'+eventId('tools',panel.task).slice(0,15)).toString();
               const recent=await channel.messages.fetch({limit:100});
               message=recent.find((m:any)=>m.author.id===client.user.id&&m.nonce===nonce)?.id;
-              if(!message)continue;
+              if(!message){this.nextAttempt.set(panel.task,Date.now()+60_000);continue;}
             }
             if(message)try{await channel.messages.delete(message);}catch(e:any){if(e.code!==10008)throw e;}
             this.store.db.prepare("UPDATE progress_panels SET state='deleted',dirty=0 WHERE task=?").run(panel.task);
@@ -168,16 +198,18 @@ export class Progress {
               const recent=await channel.messages.fetch({limit:100});
               const found=recent.find((m:any)=>m.author.id===client.user.id&&m.nonce===nonce);
               if(found)this.store.db.prepare('UPDATE progress_panels SET message=?,creating=0,dirty=1 WHERE task=?').run(found.id,panel.task);
-              else {this.store.db.prepare('UPDATE progress_panels SET dirty=1 WHERE task=?').run(panel.task);this.store.meta('progressFailure',{task:task.key,error:'Uncertain initial panel delivery; not duplicating it',time:Date.now()});}
+              else {this.nextAttempt.set(panel.task,Date.now()+60_000);this.store.db.prepare('UPDATE progress_panels SET dirty=1 WHERE task=?').run(panel.task);this.store.meta('progressFailure',{task:task.key,error:'Uncertain initial panel delivery; not duplicating it',time:Date.now()});}
               continue;
             }
             this.store.db.prepare('UPDATE progress_panels SET creating=1 WHERE task=?').run(panel.task);
             const sent=await channel.send({...payload,nonce,enforceNonce:true});
             this.store.db.prepare('UPDATE progress_panels SET message=?,creating=0 WHERE task=?').run(sent.id,panel.task);
           }
+          this.nextAttempt.delete(panel.task);
+          if(final!==undefined)timing(this.store,task,null,'panel_delivery',performance.now()-panelStarted);
           // Input can arrive while Discord is sending or editing this panel.
           this.store.db.prepare("UPDATE progress_panels SET dirty=1 WHERE task=? AND state='retired'").run(panel.task);
-        }catch(e:any){this.store.db.prepare('UPDATE progress_panels SET dirty=1 WHERE task=?').run(panel.task);this.store.meta('progressFailure',{task:task.key,error:redact(e.message),time:Date.now()});}
+        }catch(e:any){this.nextAttempt.set(panel.task,Date.now()+15_000);this.store.db.prepare('UPDATE progress_panels SET dirty=1 WHERE task=?').run(panel.task);this.store.meta('progressFailure',{task:task.key,error:redact(e.message),time:Date.now()});}
       }
     }finally{this.flushing=false;}
   }
