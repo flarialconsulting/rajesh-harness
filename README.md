@@ -43,7 +43,7 @@ Run the service as a dedicated OS user. Only allow trusted people into enabled c
 ## Set up Discord
 
 ```sh
-git clone https://github.com/flarialmc/rajesh-harness.git
+git clone https://github.com/flarialconsulting/rajesh-harness.git
 cd rajesh-harness
 pnpm install --frozen-lockfile --ignore-scripts
 pnpm setup --codex /absolute/path/to/codex --model YOUR_MODEL_ID --effort medium
