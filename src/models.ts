@@ -1,6 +1,8 @@
 import { Rpc } from './rpc.js';
 import type { Config } from './config.js';
 import { Store } from './store.js';
+import { hostname,platform,release,arch,cpus,loadavg,totalmem,freemem,uptime } from 'node:os';
+import { statfsSync } from 'node:fs';
 export interface Model {id:string;model:string;defaultReasoningEffort?:string;supportedReasoningEfforts?:{reasoningEffort:string}[];serviceTiers?:{id:string}[];additionalSpeedTiers?:string[]}
 const supportsUltrafast=(model:Model|undefined)=>model?.serviceTiers?.some(t=>t.id==='ultrafast')||model?.additionalSpeedTiers?.includes('ultrafast');
 export class ModelCommands {
@@ -15,6 +17,31 @@ export class ModelCommands {
       do{const page=await rpc.request('model/list',{includeHidden:true,cursor});models.push(...page.data);cursor=page.nextCursor??null;}while(cursor);
       return models;
     }finally{rpc.close();}
+  }
+  async usage():Promise<string> {
+    let rpc:Rpc|undefined;
+    try {
+      rpc=this.factory(this.config.codex);
+      await rpc.request('initialize',{clientInfo:{name:'rajesh',version:'1.0.0'},capabilities:{experimentalApi:true}},8000);
+      rpc.notify('initialized');
+      const result=await rpc.request('account/rateLimits/read',{},8000);
+      const limits=result.rateLimitsByLimitId?.codex??result.rateLimits;
+      const lines:string[]=[];
+      for(const window of [limits?.primary,limits?.secondary]) {
+        if(!window||typeof window.usedPercent!=='number')continue;
+        const minutes=window.windowDurationMins;
+        const label=minutes===10080?'weekly':minutes===300?'5-hour':typeof minutes==='number'?`${minutes}-minute`:'current';
+        const reset=typeof window.resetsAt==='number'?new Date(window.resetsAt*1000).toISOString().replace('T',' ').replace('.000Z',' UTC'):'unknown';
+        lines.push(`Codex ${label}: ${window.usedPercent}% used · ${Math.max(0,100-window.usedPercent)}% remaining · Resets: ${reset}`);
+      }
+      if(!lines.length)lines.push('Codex usage: unavailable');
+      if(result.ordinaryUsageAllowed===true)lines.push('Codex usage block: none');
+      else if(result.ordinaryUsageAllowed===false)lines.push('Codex usage: blocked');
+      const resets=result.rateLimitResetCredits?.availableCount;
+      if(typeof resets==='number')lines.push(`Free Codex resets available: ${resets}`);
+      return lines.join('\n');
+    }catch{return 'Codex usage: unavailable (could not read current limits)';}
+    finally{rpc?.close();}
   }
   async run(text:string,taskKey?:string,defaultKey?:string,fallback?:{model:string;effort:string}) {
     const [command,name,effort,...extra]=text.trim().split(/\s+/);
@@ -38,7 +65,13 @@ export class ModelCommands {
     if(command==='/status') {
       const running=Number(this.store.db.prepare("SELECT count(*) n FROM tasks WHERE status='running'").get()!.n);
       const queued=Number(this.store.db.prepare("SELECT count(DISTINCT task) n FROM jobs WHERE state='queued'").get()!.n);
-      return `Running tasks: ${running} · Queued tasks: ${queued}\nModel: ${current?.model??'not selected'} / ${current?.effort??'default'}${task?'':' (new-task default)'}\nService tier preference: ${tier??'automatic'}`;
+      const gib=(n:number)=>(n/1024**3).toFixed(1)+' GiB';let disk='unavailable';
+      try{const fs=statfsSync(this.config.dataDir??process.cwd());disk=`${gib(Number(fs.bavail)*Number(fs.bsize))} free / ${gib(Number(fs.blocks)*Number(fs.bsize))}`;}catch{}
+      const hours=Math.floor(uptime()/3600);
+      const oldest=this.store.db.prepare("SELECT min(created) at FROM jobs WHERE state='queued'").get()?.at;
+      const waiting=oldest?` · Oldest wait: ${Math.floor((Date.now()-Number(oldest))/1000)}s`:'';
+      const usage=await this.usage();
+      return `Running tasks: ${running} · Queued tasks: ${queued}${waiting} · Task limit: ${this.config.concurrency}\nModel: ${current?.model??'not selected'} / ${current?.effort??'default'}${task?'':' (new-task default)'}\nService tier preference: ${tier??'automatic'}\nSystem: ${hostname()} · ${platform()} ${release()} ${arch()}\nCPU: ${cpus().length} cores · Load: ${loadavg().map(n=>n.toFixed(2)).join(' / ')}\nRAM: ${gib(totalmem()-freemem())} used / ${gib(totalmem())}\nDisk: ${disk}\nUptime: ${Math.floor(hours/24)}d ${hours%24}h\n${usage}`;
     }
     if(command==='/model'&&!name)return `Model: ${current?.model??'not selected'} / ${current?.effort??'default'}\nUse /model MODEL [REASONING]. ${task?'Changes this conversation.':'Changes the default for new tasks in this channel.'}`;
     if(extra.length||(command==='/models'&&name))return 'Usage: /models or /model MODEL [REASONING]';
@@ -68,7 +101,7 @@ export class ModelCommands {
       const guild=await client.guilds.fetch(guildId).catch(()=>null);if(!guild)continue;
       await guild.commands.create({name:'models',description:'List available Codex models and reasoning levels'});
       await guild.commands.create({name:'stop',description:'Force stop this task and cancel queued input'});
-      await guild.commands.create({name:'status',description:'Show running tasks, server health, and this conversation’s model'});
+      await guild.commands.create({name:'status',description:'Show task counts, server health, and Codex usage'});
       await guild.commands.create({name:'ultrafast',description:'Enable or disable ultrafast for this task thread',options:[{name:'enabled',description:'True enables ultrafast; false returns to standard speed (default: true)',type:5,required:false}]});
       await guild.commands.create({name:'model',description:'Show or change this conversation’s model, or the channel default',options:[{name:'model',description:'Exact model ID from /models',type:3,required:false},{name:'reasoning',description:'Reasoning level supported by the selected model',type:3,required:false}]});
     }

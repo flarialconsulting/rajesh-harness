@@ -11,11 +11,14 @@ The runtime uses the [Codex App Server](https://learn.chatgpt.com/docs/app-serve
 - Starts a Discord thread for each task, or uses a configured channel as one conversation.
 - Accepts WhatsApp mentions and replies in one configured group. `/new` starts another conversation.
 - Steers running tasks with follow-up messages. `/stop` cancels queued input and stops the task process.
-- Stores messages, jobs, schedules, and delivery receipts in SQLite; archives older transcripts as compressed JSONL.
+- Stores messages, jobs, schedules, and delivery receipts in SQLite; archives conversations, outcomes and brief failures as compressed JSONL. Optional session compression restores history before resuming a conversation.
 - Provides MCP tools for message search, explicit memory, reusable skills, Git worktrees, schedules, and file delivery.
 - Runs turns on validated source snapshots and applies updates between turns.
-- Sends final replies against the original prompt, with durable delivery receipts.
-- Reports workspace-scoped queue, startup, response, tool, and delivery timings without storing prompts in timing records.
+- Sends final replies against the original prompt, with durable delivery receipts. Long Discord replies stay in chat as separate messages.
+- Reports workspace-scoped queue, startup, response, tool, and delivery timings without storing prompts in timing records. `/status` also shows system health and the connected Codex account's current usage limits.
+- Retries selected-model capacity failures with bounded backoff while preserving the conversation. `/stop` cancels retries.
+- Finds related tasks, sends scoped follow-ups, and creates separate Discord tasks when the user explicitly requests delegation.
+- Reuses task worktrees and removes idle ones after 24 hours, preserving branches, patches and untracked source for recovery.
 
 This public edition has no organization-specific incident automation, private workspace instructions, voice-note shortcuts, account-usage dashboards, deployment credentials, or imported conversation history.
 
@@ -36,7 +39,7 @@ This update path covers task runtime behavior. Connection setup and supervisor/b
 
 ## Requirements
 
-Use Linux, Node.js 22.13 or newer, pnpm 10, Git, ripgrep, and an authenticated Codex CLI with the App Server protocol. Linux is the tested target; process groups and Unix sockets are part of the runtime. Dependencies are pinned in `pnpm-lock.yaml`.
+Use Linux, Node.js 22.15 or newer, pnpm 10, Git, ripgrep, and an authenticated Codex CLI with the App Server protocol. Linux is the tested target; process groups and Unix sockets are part of the runtime. Dependencies are pinned in `pnpm-lock.yaml`. Node 22.15 adds the [Zstandard streams](https://nodejs.org/api/zlib.html#zlibcreatezstdcompressoptions) used for optional session compression. Install `tar` for worktree recovery and `zstd` if you want ripgrep to search Zstandard archives.
 
 Run the service as a dedicated OS user. Only allow trusted people into enabled channels and groups: their messages can start an agent with that user's filesystem and tool access. Workspace routing separates conversation context; it is not an OS security boundary. See [SECURITY.md](SECURITY.md).
 
@@ -77,6 +80,8 @@ Run from the repository root. The supervisor snapshots the root `config.json`; u
 - `concurrency` limits active tasks globally, from 1 to 32. `timezone` sets the schedule default; it defaults to UTC. Individual schedules can override it.
 - `agent.name` sets the bot's prompt identity. `agent.instructions` replaces the default task instructions. Protocol and file-delivery requirements still need to be respected by custom instructions.
 - `agent.sandbox` accepts `read-only`, `workspace-write`, or `danger-full-access`. The default is `workspace-write`. Interactive tool approvals are rejected because the transports do not implement an approval UI.
+- `historyRetention: true` enables hourly compression of idle bot-owned Codex sessions and older conversation archives. It defaults to false. Before removing plaintext, the harness verifies the compressed bytes against a SHA-256 digest. Resuming or compacting a compressed conversation restores it first. Conversation archives retain messages, agent replies, outcomes and brief errors; raw tool traces are omitted.
+- `taskDispatch` optionally selects a Discord destination with `{ "account": "main", "channel": "YOUR_DISCORD_CHANNEL_ID" }`. It must match an enabled route in the source task's workspace. Discord tasks otherwise create sibling threads in their current parent channel. WhatsApp dispatch requires this setting. The tools require an explicit user request to delegate and do not grant peers permission to merge or deploy.
 - `dataDir` holds private state and runtime snapshots. `secretsDir` holds transport credentials. `codexHome` selects the CLI's private authentication/configuration directory. `codex` is the executable path.
 
 No model is selected in source code. Discord routes and the WhatsApp settings supply model and effort explicitly. Inherited Codex MCP servers and plugins are disabled; this runtime attaches its own tools.
@@ -97,6 +102,8 @@ Discord and WhatsApp can run separately or together. Set `routes` to `[]` for Wh
 
 With the service stopped, run `pnpm pair:whatsapp`. Enter your phone number locally, then enter the displayed pairing code in WhatsApp's Linked devices flow. Do not share that code or the generated credentials. Run `pnpm doctor`, then `pnpm start`.
 
+`/fast` and `/fast on` request the fast service tier for future WhatsApp turns; `/fast off` returns to the default tier. The preference survives `/new`. Model and reasoning stay unchanged, and a running turn keeps its current tier. Availability depends on the connected account and selected model.
+
 The first start imports the paired session into private SQLite storage. Pairing files alone do not replace an existing imported session. Back up the entire private data directory before any session migration. This adapter uses Baileys, a third-party WhatsApp Web client, rather than the official WhatsApp Business API.
 
 ## State and updates
@@ -107,6 +114,8 @@ See [self-editing](#self-editing-between-turns) for the draft and publication wo
 
 Use your process manager to run `pnpm start` with the repository as its working directory. SIGTERM shuts down connections and marks active work interrupted. On restart, uncertain tool execution or outgoing deliveries are not blindly replayed. Reply to an interrupted task to continue. Upgrade the Codex binary yourself after checking compatibility; there is no automatic binary updater.
 
+Task worktrees live under `dataDir/worktrees`. Cleanup checks conversation activity, queued work, file changes, worktree locks and running processes. If it cannot establish that removal is safe, it leaves the worktree in place. Recovery files live under `dataDir/worktree-recovery`; branches remain in the source repository. These files may contain private configuration, so keep them out of public backups.
+
 ## Development
 
 ```sh
@@ -116,5 +125,7 @@ pnpm audit:export
 ```
 
 CI checks the build and scans the public files and Git history for secrets. Validate runtime behavior end to end before releasing a change.
+
+This public edition was synced from validated harness source revision `b26eb80d584851ce02965721172da76265bd7bdeda7e94c02449e18e221a995b` on 2026-10-23. It keeps standalone configuration and excludes operator-specific integrations, deployment automation and private runtime state.
 
 MIT licensed.

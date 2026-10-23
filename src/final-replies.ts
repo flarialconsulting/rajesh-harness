@@ -1,3 +1,4 @@
+import {splitMessage} from './message-chunks.js';
 import { Store, type Task, eventId } from './store.js';
 
 export interface FinalReply { channel:string; message:string; user?:string; raw?:string }
@@ -30,12 +31,16 @@ export async function sendDiscordFinal(store:Store,task:Task,text:string,id:stri
   const link=!sameChannel&&channel.guildId?`[Original prompt](https://discord.com/channels/${channel.guildId}/${target.channel}/${target.message})`:'';
   const header=sameChannel?'':[user?`<@${user}>`:'',link].filter(Boolean).join(' ');
   const content=header?`${header}\n\n${text}`:text;
-  const payload:any={content:content.length<=2000?content:content.slice(0,1900)+'\n\nFull response attached.',
-    ...(sameChannel?{reply:{messageReference:target.message,failIfNotExists:false}}:{}),
-    allowedMentions:sameChannel?{parse:[],repliedUser:true}:{parse:[],users:user?[user]:[]},
-    nonce:BigInt('0x'+eventId(id,'final-reply').slice(0,15)).toString(),enforceNonce:true};
-  if(content.length>2000)payload.files=[{attachment:Buffer.from(text),name:'response.md'}];
-  const sent=await channel.send(payload);
-  store.meta(`finalReplySent:${id}`,sent.id);
-  return sent.id as string;
+  const ids:string[]=store.meta(`finalReplyParts:${id}`)??[];
+  for(const [index,part] of splitMessage(content).entries()) {
+    if(ids[index])continue;
+    const payload:any={content:part,
+      ...(sameChannel&&index===0?{reply:{messageReference:target.message,failIfNotExists:false}}:{}),
+      allowedMentions:index===0?(sameChannel?{parse:[],repliedUser:true}:{parse:[],users:user?[user]:[]}):{parse:[]},
+      nonce:BigInt('0x'+eventId(id,index===0?'final-reply':`final-reply:${index}`).slice(0,15)).toString(),enforceNonce:true};
+    const sent=await channel.send(payload);ids[index]=sent.id;
+    store.meta(`finalReplyParts:${id}`,ids);
+  }
+  const sent=ids.join(',');store.meta(`finalReplySent:${id}`,sent);
+  return sent;
 }

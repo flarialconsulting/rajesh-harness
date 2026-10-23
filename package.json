@@ -29,7 +29,7 @@
   "description": "Self-hosted Discord and WhatsApp task runner for Codex",
   "license": "MIT",
   "engines": {
-    "node": ">=22.13.0"
+    "node": ">=22.15.0"
   },
   "packageManager": "pnpm@10.29.2"
 }

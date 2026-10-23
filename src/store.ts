@@ -6,6 +6,8 @@ import { createHash } from 'node:crypto';
 import type { Workspace } from './config.js';
 import { redactValue } from './redact.js';
 import { ensureLatencyStorage } from './latency.js';
+import {ensureWorktreeStorage,touchTask} from './worktree-state.js';
+import {retainedEvent} from './history-retention.js';
 
 export interface Message {
   id: string; platform: string; workspace: Workspace; channel: string; author: string;
@@ -28,6 +30,8 @@ export class Store {
       CREATE INDEX IF NOT EXISTS message_context ON messages(workspace, channel, time);
       CREATE TABLE IF NOT EXISTS tasks (key TEXT PRIMARY KEY, workspace TEXT, platform TEXT, account TEXT, channel TEXT, parent TEXT, model TEXT, effort TEXT, thread TEXT, cwd TEXT, status TEXT);
       CREATE TABLE IF NOT EXISTS jobs (id INTEGER PRIMARY KEY, task TEXT REFERENCES tasks(key), message TEXT UNIQUE, prompt TEXT, state TEXT, created INTEGER);
+      CREATE INDEX IF NOT EXISTS tasks_cwd ON tasks(cwd);
+      CREATE INDEX IF NOT EXISTS jobs_task_state ON jobs(task,state);
       CREATE TABLE IF NOT EXISTS deliveries (id TEXT PRIMARY KEY, task TEXT, text TEXT, state TEXT, external TEXT);
       CREATE TABLE IF NOT EXISTS archive (id TEXT PRIMARY KEY, workspace TEXT, channel TEXT, time INTEGER, payload TEXT, exported INTEGER DEFAULT 0);
       CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT);
@@ -36,6 +40,7 @@ export class Store {
       CREATE TABLE IF NOT EXISTS inbox (id TEXT PRIMARY KEY, platform TEXT, account TEXT, channel TEXT, message TEXT, payload TEXT, state TEXT);
     `);
     ensureLatencyStorage(this);
+    ensureWorktreeStorage(this);
   }
   transaction<T>(fn: () => T): T {
     if(this.transactionDepth)return fn();
@@ -46,14 +51,19 @@ export class Store {
     finally {this.transactionDepth--;}
   }
   record(m: Message) {
+    if(m.platform==='legacy'&&m.author==='toolResult')return false;
     m=redactValue(m);
     return this.transaction(() => {
       const result = this.db.prepare('INSERT OR IGNORE INTO messages VALUES (?,?,?,?,?,?,?,?,?,?)').run(m.id,m.platform,m.workspace,m.channel,m.author,m.text,m.time,+m.bot,m.replyTo??null,JSON.stringify(m.raw??null));
-      if (result.changes) this.event(m.workspace,m.channel,m.id,{type:'message',...m},m.time);
+      if (result.changes) {
+        this.event(m.workspace,m.channel,m.id,{type:'message',...m},m.time);
+        for(const row of this.db.prepare('SELECT key FROM tasks WHERE workspace=? AND platform=? AND channel=?').all(m.workspace,m.platform,m.channel))touchTask(this,String(row.key),m.time);
+      }
       return !!result.changes;
     });
   }
   event(workspace: string, channel: string, id: string, value: unknown, time=Date.now()) {
+    value=retainedEvent(value);if(value===null)return;
     this.db.prepare('INSERT OR IGNORE INTO archive(id,workspace,channel,time,payload) VALUES (?,?,?,?,?)').run(id,workspace,channel,time,JSON.stringify(redactValue({archiveId:id,time,...(value as object)})));
   }
   recent(workspace: string, channel: string, limit=50, before=Number.MAX_SAFE_INTEGER): Message[] {
@@ -68,7 +78,12 @@ export class Store {
   }
   task(key: string) { return this.db.prepare('SELECT * FROM tasks WHERE key=?').get(key) as unknown as Task|undefined; }
   saveTask(t: Task) { this.db.prepare('INSERT OR REPLACE INTO tasks VALUES (?,?,?,?,?,?,?,?,?,?,?)').run(t.key,t.workspace,t.platform,t.account,t.channel,t.parent,t.model,t.effort,t.thread,t.cwd,t.status); }
-  enqueue(task: string, message: string, prompt: string) { return this.db.prepare("INSERT OR IGNORE INTO jobs(task,message,prompt,state,created) VALUES (?,?,?,'queued',?)").run(task,message,prompt,Date.now()); }
+  enqueue(task: string, message: string, prompt: string) {
+    const now=Date.now();
+    const result=this.db.prepare("INSERT OR IGNORE INTO jobs(task,message,prompt,state,created) VALUES (?,?,?,'queued',?)").run(task,message,prompt,now);
+    if(result.changes)touchTask(this,task,now);
+    return result;
+  }
   pending() { return this.db.prepare("SELECT * FROM jobs WHERE state='queued' ORDER BY id").all() as unknown as Job[]; }
   jobState(id: number, state: string) { this.db.prepare('UPDATE jobs SET state=? WHERE id=?').run(state,id); }
   recover() {

@@ -9,11 +9,9 @@ import { discordAttachments } from './attachments.js';
 import { redact } from './redact.js';
 
 
-export function splitMessage(text:string,size=1900):string[] {
-  const chunks:string[]=[];
-  while(text.length>size){let cut=text.lastIndexOf('\n',size);if(cut<size/2)cut=size;chunks.push(text.slice(0,cut));text=text.slice(cut).replace(/^\n/,'');}
-  if(text)chunks.push(text);return chunks;
-}
+export {splitMessage} from './message-chunks.js';
+import {splitMessage} from './message-chunks.js';
+
 export class DiscordAdapter {
   clients=new Map<string,Client>(); locks=new Map<string,Promise<void>>();
   constructor(public config:Config,public store:Store,public engine:Engine){}

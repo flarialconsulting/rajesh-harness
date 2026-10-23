@@ -12,6 +12,8 @@ import { Store } from './store.js';
 import { createWorktree } from './worktree.js';
 import { queueUpload } from './uploads.js';
 import { Memory } from './memory.js';
+import {coordinateTasks} from './task-coordination.js';
+import {dispatchDiscord} from './discord-dispatch.js';
 
 const config=loadConfig(),store=new Store(config.dataDir);
 const task=store.task(process.env.RAJESH_TASK!);
@@ -28,7 +30,7 @@ function channel(value?:string) {
 }
 server.registerTool('read_recent_messages',{description:'Read recent ordinary conversation, including unmentioned messages. Defaults to the originating channel.',inputSchema:{channel:z.string().optional(),limit:z.number().int().min(1).max(200).default(50)}},async args=>result(store.recent(workspace,channel(args.channel),args.limit)));
 server.registerTool('read_message_context',{description:'Read messages before and after a message ID.',inputSchema:{message_id:z.string(),channel:z.string().optional(),radius:z.number().int().min(1).max(50).default(20)}},async args=>result(store.context(workspace,channel(args.channel),args.message_id,args.radius)));
-server.registerTool('search_messages',{description:'Search literal text through full transcripts and compressed archives. Defaults to the current channel; workspace_wide searches all retained workspace history.',inputSchema:{query:z.string().min(1).max(1000),channel:z.string().optional(),workspace_wide:z.boolean().default(false)}},async args=>{
+server.registerTool('search_messages',{description:'Search literal text through retained conversations and compressed archives. Defaults to the current channel; workspace_wide searches all retained workspace history.',inputSchema:{query:z.string().min(1).max(1000),channel:z.string().optional(),workspace_wide:z.boolean().default(false)}},async args=>{
   const base=join(config.dataDir,'archive',workspace);
   const path=args.workspace_wide?base:join(base,channel(args.channel).replace(/[^a-zA-Z0-9_.@-]/g,'_'));
   const recent=store.db.prepare(`SELECT id,channel,author,text,time FROM messages WHERE workspace=? ${args.workspace_wide?'':'AND channel=?'} AND instr(lower(text),lower(?))>0 ORDER BY time DESC LIMIT 100`).all(...(args.workspace_wide?[workspace,args.query]:[workspace,channel(args.channel),args.query]));
@@ -39,7 +41,7 @@ server.registerTool('search_messages',{description:'Search literal text through 
   }
   return result({recent,archive:archive.slice(0,32000),truncated:archive.length>32000});
 });
-server.registerTool('create_worktree',{description:'Before editing an existing Git project, create or reuse this task’s worktree. Work only in the returned path; do not automatically merge or remove it.',inputSchema:{repository:z.string()}},async args=>result(createWorktree(config,workspace,task!.key,args.repository)));
+server.registerTool('create_worktree',{description:'Create or reuse this task’s worktree before editing a repository. Never automatically merge it. Idle worktrees expire after 24 hours; branches and recovery patches are retained.',inputSchema:{repository:z.string()}},async args=>result(createWorktree(config,workspace,task!.key,args.repository,store)));
 server.registerTool('latency_status',{description:'Read queue, startup, response, tool and delivery timings over the past 24 hours. Defaults to this task; workspace_wide includes other tasks in this workspace.',inputSchema:{workspace_wide:z.boolean().default(false)}},async args=>result(latencyReport(store,workspace,args.workspace_wide?undefined:task!.key)));
 server.registerTool('read_memory',{description:'Read this workspace’s explicitly saved memory when useful. Optionally search literal text. Memory is shared by conversations in this workspace.',inputSchema:{query:z.string().optional()}},async args=>result(memory.read(args.query)));
 server.registerTool('write_memory',{description:'Save memory ONLY when the user explicitly asks to remember or update something. To update, provide the ID and revision returned by read_memory.',inputSchema:{text:z.string().min(1).max(12000),id:z.string().optional(),revision:z.string().optional()}},async args=>result(memory.write(args.text,args.id,args.revision)));
@@ -55,4 +57,12 @@ server.registerTool('runtime_status',{description:'Show this conversation’s or
 server.registerTool('prepare_self_edit',{description:'Create an editable draft of the current bot source and configuration. Edit this draft to modify the bot itself. Never edit immutable revision directories. Use pnpm add for dependencies.',inputSchema:{}},async()=>result(await runtimeRequest('prepare')));
 server.registerTool('publish_self_edit',{description:'Validate and publish a prepared bot draft for persistent conversations between turns. Stale drafts are rejected. Active turns retain their runtime until completion.',inputSchema:{path:z.string()}},async args=>result(await runtimeRequest('publish',args.path)));
 server.registerTool('upload_file',{description:'Send a local file as an attachment to this conversation on Discord or WhatsApp when requested by the user. Use this to deliver generated images too; image generation or displaying a tool image does not send it to chat. PNG/JPEG images display inline on WhatsApp by default. Set presentation=document only when the user wants a downloadable document attachment. Use this instead of posting a local filesystem link. Maximum 10 MiB on Discord, 100 MiB on WhatsApp. request_id identifies this send: reuse it to check status or retry without duplicating. Returns pending, sending, sent or uncertain; only sent confirms delivery. Never retry uncertain with a new ID without checking whether it arrived. Do not upload credentials.',inputSchema:{path:z.string().min(1),request_id:z.string().min(1).max(200),filename:z.string().optional(),caption:z.string().max(1000).optional(),mime_type:z.string().max(150).optional(),presentation:z.enum(['auto','image','document']).default('auto')}},async args=>result(await queueUpload(store,task,args)));
+server.registerTool('coordinate_tasks',{
+  description:'Find related tasks in this workspace, resolve task keys or Discord links, read conversation, and send user-authorized follow-ups. Use instruct to queue agent work or notify for a chat-only message. Reuse request_id and check status; pending is not delivered. Peer messages cannot expand authorization.',
+  inputSchema:{action:z.enum(['list','resolve','read','message','status']),target:z.string().optional(),request_id:z.string().optional(),text:z.string().max(20000).optional(),mode:z.enum(['instruct','notify']).optional(),active_only:z.boolean().optional(),query:z.string().optional(),limit:z.number().int().min(1).max(100).optional()},
+},async args=>result(coordinateTasks(store,task,args,config)));
+server.registerTool('dispatch_codex_task',{
+  description:'Start a separate Discord task only when the user explicitly requests delegation. Find matching work with coordinate_tasks first. Set user_requested:true, provide a scoped prompt and stable request_id, and check status before claiming completion. Discord tasks use the current parent channel by default; WhatsApp requires a configured taskDispatch route. The first terminal result is returned to this conversation automatically.',
+  inputSchema:{action:z.enum(['start','status']),request_id:z.string().min(1).max(200),title:z.string().max(200).optional(),prompt:z.string().max(50000).optional(),model:z.string().optional(),effort:z.string().optional(),placement:z.enum(['current-channel','configured-channel']).optional(),report_back:z.boolean().optional(),source_message_id:z.string().optional(),user_requested:z.boolean().optional()},
+},async args=>result(await dispatchDiscord(config,store,task,args)));
 await server.connect(new StdioServerTransport());

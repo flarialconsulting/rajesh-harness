@@ -16,5 +16,6 @@
   "whatsappGroup": "",
   "concurrency": 2,
   "timezone": "UTC",
+  "historyRetention": false,
   "agent": { "name": "Rajesh", "sandbox": "workspace-write" }
 }

@@ -122,7 +122,8 @@ export class WhatsAppAdapter {
     if(!live||m.key.fromMe)return;
     const self=[this.socket?.user?.id,this.socket?.user?.lid].filter(Boolean).map(x=>jidNormalizedUser(x!));
     const prompt=text.replace(/@\d+/g,'').trim();
-    if(!mentioned(m,self)&&prompt!=='/new')return;
+    const fastCommand=/^\/fast(?:\s|$)/.test(prompt);
+    if(!mentioned(m,self)&&prompt!=='/new'&&!fastCommand)return;
     this.store.db.prepare("INSERT OR IGNORE INTO inbox VALUES (?,'whatsapp',?,?,?,?,'pending')").run(id,this.config.whatsappAccount!,group,m.key.id,JSON.stringify(m,BufferJSON.replacer));
     if(this.store.db.prepare('SELECT state FROM inbox WHERE id=?').get(id)?.state==='done')return;
     if(prompt==='/new'&&this.newConversation) {
@@ -138,7 +139,16 @@ export class WhatsAppAdapter {
     if(!this.store.task(task.key))this.store.saveTask(task);
     const quoted=normalizeMessageContent(body?.contextInfo?.quotedMessage);
     const quote=quoted?.conversation??quoted?.extendedTextMessage?.text??quoted?.imageMessage?.caption??quoted?.videoMessage?.caption??quoted?.documentMessage?.caption??'';
-    if(!await this.engine.command(task,prompt,m.key.id)) {
+    if(fastCommand) {
+      const [,mode,...extra]=prompt.split(/\s+/);
+      let reply:string;
+      if(extra.length||(mode!==undefined&&mode!=='on'&&mode!=='off'))reply='Use /fast, /fast on, or /fast off.';
+      else {
+        this.store.meta(`waServiceTier:${group}`,mode==='off'?'default':'fast');
+        reply=`Fast mode is ${mode==='off'?'off':'on'} for future turns in this WhatsApp session, including after /new. A running turn keeps its current speed.`;
+      }
+      await this.engine.tell(task,reply,`fast:${id}`);
+    } else if(!await this.engine.command(task,prompt,m.key.id)) {
       const attachments=[await this.attachment(m,task.cwd)];
       if(quoted&&body?.contextInfo?.stanzaId) {
         const quoteId=`whatsapp:${group}:${body.contextInfo.stanzaId}`;

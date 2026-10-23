@@ -1,7 +1,9 @@
+import {splitMessage} from './message-chunks.js';
 import { Store,type Task,eventId } from './store.js';
 import { redact } from './redact.js';
 import { timing,ensureLatencyStorage } from './latency.js';
 import { rememberFinalReply,sendDiscordFinal } from './final-replies.js';
+import {cleanupWorktrees} from './worktree-cleanup.js';
 const toolTypes=new Set(['commandExecution','fileChange','mcpToolCall','dynamicToolCall','webSearch','imageView','imageGeneration','collabAgentToolCall','computerUse','toolCall']);
 export function toolLine(item:any) {
   const detail=item.command??(item.tool?`${item.server??''}/${item.tool} ${JSON.stringify(item.arguments??{})}`:item.query??item.action?.query??item.changes?.map((c:any)=>c.path).join(', ')??item.path??'');
@@ -18,6 +20,8 @@ export class Progress {
   clients=new Map<string,any>();socket:()=>any=()=>undefined;flushing=false;pendingFlush?:Promise<void>;
   nextAttempt=new Map<string,number>();
   lastFlushAt=0;
+  nextWorktreeSweep=0;
+  worktreeSweepPending=false;
   constructor(public store:Store) {
     store.db.exec(`CREATE TABLE IF NOT EXISTS tool_activity(task TEXT,item TEXT,line TEXT,status TEXT,PRIMARY KEY(task,item));
       CREATE TABLE IF NOT EXISTS progress_panels(task TEXT PRIMARY KEY,message TEXT,state TEXT,dirty INTEGER,creating INTEGER DEFAULT 0);
@@ -87,7 +91,7 @@ export class Progress {
         this.store.meta(`panel:${task.key}`,next);this.panel(task);
         this.store.db.prepare("UPDATE progress_panels SET state='queued',dirty=1 WHERE task=?").run(next);
       }
-      // A steering message takes ownership of the activity panel. Keep this terminal
+      // A new steering message takes ownership of the result. Keep this terminal
       // state even when all jobs in the shared turn later complete together.
       this.store.db.prepare(`UPDATE progress_reactions SET state='superseded'
         WHERE task=? AND message!=? AND state!='superseded'
@@ -128,6 +132,11 @@ export class Progress {
     this.pendingFlush=this.flushNow().finally(()=>{this.pendingFlush=undefined;});return this.pendingFlush;
   }
   private async flushNow() {
+    if(!this.worktreeSweepPending&&Date.now()>=this.nextWorktreeSweep) {
+      this.nextWorktreeSweep=Date.now()+5*60*1000;this.worktreeSweepPending=true;
+      void cleanupWorktrees(this.store).catch(e=>{try{this.store.meta('worktreeCleanupFailure',{at:Date.now(),error:redact(String(e.message))});}catch{}})
+        .finally(()=>{this.worktreeSweepPending=false;});
+    }
     this.flushing=true;
     const flushStarted=performance.now();
     if(this.lastFlushAt&&flushStarted-this.lastFlushAt>10_000)this.store.meta('progressTickGap',{gapMs:Math.round(flushStarted-this.lastFlushAt),time:Date.now()});
@@ -187,9 +196,9 @@ export class Progress {
           const rows=(this.store.db.prepare('SELECT line,status FROM tool_activity WHERE task=? ORDER BY rowid DESC LIMIT 25').all(panel.task) as any[]).reverse();
           const count=Number(this.store.db.prepare('SELECT count(*) n FROM tool_activity WHERE task=?').get(panel.task)!.n);
           const final=this.store.meta(`panelFinal:${panel.task}`) as string|undefined;
-          const content=final===undefined?renderTools(rows,count,panel.state):final.length<=2000?final:final.slice(0,1900)+'\n\nFull response attached.';
+          const content=final===undefined?renderTools(rows,count,panel.state):splitMessage(final)[0];
           const payload:any={content,allowedMentions:{parse:[]}};
-          if(final!==undefined){payload.attachments=[];if(final.length>2000)payload.files=[{attachment:Buffer.from(final),name:'response.md'}];}
+          if(final!==undefined)payload.attachments=[];
           this.store.db.prepare('UPDATE progress_panels SET dirty=0 WHERE task=?').run(panel.task);
           if(panel.message)await channel.messages.edit(panel.message,payload);
           else {
@@ -204,6 +213,14 @@ export class Progress {
             this.store.db.prepare('UPDATE progress_panels SET creating=1 WHERE task=?').run(panel.task);
             const sent=await channel.send({...payload,nonce,enforceNonce:true});
             this.store.db.prepare('UPDATE progress_panels SET message=?,creating=0 WHERE task=?').run(sent.id,panel.task);
+          }
+          if(final!==undefined){
+            const parts=splitMessage(final),sent:string[]=this.store.meta(`panelFinalParts:${panel.task}`)??[];
+            for(let index=1;index<parts.length;index++){
+              if(sent[index])continue;
+              const message=await channel.send({content:parts[index],allowedMentions:{parse:[]},nonce:BigInt('0x'+eventId('panel-final',panel.task,String(index)).slice(0,15)).toString(),enforceNonce:true});
+              sent[index]=message.id;this.store.meta(`panelFinalParts:${panel.task}`,sent);
+            }
           }
           this.nextAttempt.delete(panel.task);
           if(final!==undefined)timing(this.store,task,null,'panel_delivery',performance.now()-panelStarted);
